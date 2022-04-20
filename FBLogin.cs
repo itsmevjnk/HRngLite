@@ -20,7 +20,8 @@ namespace HRngLite
         /// <returns><c>true</c> if there's a logged in account, or <c>false</c> otherwise.</returns>
         public static async Task<bool> VerifyLogin()
         {
-            return ((await HTTPHelper.GetRequest("https://mbasic.facebook.com")).DocumentNode.SelectSingleNode("//input[@name='login']") != null);
+            HtmlDocument doc = await HTTPHelper.GetRequest("https://mbasic.facebook.com");
+            return (doc.DocumentNode.SelectSingleNode("//input[@name='login']") == null);
         }
 
         /// <summary>
@@ -71,7 +72,7 @@ namespace HRngLite
             var form = doc.DocumentNode.SelectSingleNode("//form[@id='login_form']");
             if (form == null) return -1;
             var login_data = new Dictionary<string, string>(); // What we will use to store our POST request data
-            var inputs = form.SelectNodes(".//input[@type='hidden' or (@type='submit' and @name='login')]");
+            var inputs = form.SelectNodes(".//input[@name and (@type='hidden' or (@type='submit' and @name='login'))]");
             if (inputs == null) return -1;
             foreach (HtmlNode input in inputs) login_data.Add(input.Attributes["name"].DeEntitizeValue, ((input.Attributes["value"] == null) ? "" : input.Attributes["value"].DeEntitizeValue)); // This will add all the hidden data, including CSRF protection ones
             login_data.Add("email", email); login_data.Add("pass", password);
@@ -120,6 +121,7 @@ namespace HRngLite
         ///   <item><description>-1: Already logged in successfully (no 2FA required)</description></item>
         ///   <item><description>-2: Deformed checkpoint page</description></item>
         ///   <item><description>-4: Wrong OTP</description></item>
+        ///   <item><description>-5: Login review required. The user is supposed to respond by logging into Facebook normally and approving/rejecting the login request. Since HRng rotates User-Agent strings, any unknown login attempts can be safely rejected.</description></item> 
         ///  </list>
         /// </returns>
         public static async Task<int> LoginOTP(string otp, IDictionary<string, string>? cookies = null)
@@ -133,10 +135,13 @@ namespace HRngLite
 
             /* Save hidden POST data */
             var login_data = new Dictionary<string, string>();
-            var inputs = form.SelectNodes("./input"); // Top level inputs
+            var inputs = form.SelectNodes("./input[@name]"); // Top level inputs
             if (inputs == null) return -2;
             foreach (HtmlNode input in inputs) login_data.Add(input.Attributes["name"].DeEntitizeValue, ((input.Attributes["value"] == null) ? "" : input.Attributes["value"].DeEntitizeValue));
-            inputs = form.SelectNodes("./div/div/div[position()<3]//input[@type!='text']"); // Inputs in divs (except language chooser inputs)
+            inputs = form.SelectNodes(".//article/section//input[@name and @type!='text']"); // Inputs in login code section
+            if (inputs == null) return -2;
+            foreach (HtmlNode input in inputs) login_data.Add(input.Attributes["name"].DeEntitizeValue, ((input.Attributes["value"] == null) ? "" : input.Attributes["value"].DeEntitizeValue));
+            inputs = form.SelectNodes(".//article/div[1]//input[@name]"); // Inputs in submit button section
             if (inputs == null) return -2;
             foreach (HtmlNode input in inputs) login_data.Add(input.Attributes["name"].DeEntitizeValue, ((input.Attributes["value"] == null) ? "" : input.Attributes["value"].DeEntitizeValue));
 
@@ -156,17 +161,19 @@ namespace HRngLite
                 form = doc.DocumentNode.SelectSingleNode("//form[contains(@action, '/login/checkpoint/')]");
                 if (form == null) return -2;
                 login_data.Clear();
-                inputs = form.SelectNodes("./input"); // Top level inputs
+                inputs = form.SelectNodes("./input[@name]"); // Top level inputs
                 if (inputs == null) return -2;
                 foreach (HtmlNode input in inputs) login_data.Add(input.Attributes["name"].DeEntitizeValue, ((input.Attributes["value"] == null) ? "" : input.Attributes["value"].DeEntitizeValue));
-                inputs = form.SelectNodes("./div/div/div[2]//input"); // Inputs in the div with Continue button
+                inputs = form.SelectNodes(".//article/div[1]//input[@name]"); // Inputs in the div with Continue button
                 if (inputs == null) return -2;
                 foreach (HtmlNode input in inputs) login_data.Add(input.Attributes["name"].DeEntitizeValue, ((input.Attributes["value"] == null) ? "" : input.Attributes["value"].DeEntitizeValue));
                 login_data.Add("name_action_selected", "save_device"); // Specify action
-                await HTTPHelper.PostRequest(new Uri(new Uri("https://mbasic.facebook.com"), form.Attributes["action"].DeEntitizeValue).AbsoluteUri, login_data); // Send prompt response
+                doc = await HTTPHelper.PostRequest(new Uri(new Uri("https://mbasic.facebook.com"), form.Attributes["action"].DeEntitizeValue).AbsoluteUri, login_data); // Send prompt response
+                if (doc.DocumentNode.SelectSingleNode("//*[@id='checkpointSubmitButton']") != null) return -5;
             }
 
             GetCookies(cookies);
+
             return 0;
         }
 
