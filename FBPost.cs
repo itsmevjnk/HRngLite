@@ -67,10 +67,12 @@ namespace HRngLite
             var resp = await CommonHTTP.Client.GetAsync(url);
             resp.EnsureSuccessStatusCode();
             doc.LoadHtml(await resp.Content.ReadAsStringAsync());
+            var req_uri = resp.RequestMessage.RequestUri;
+            if (req_uri.ToString().Contains("/watch/")) req_uri = new Uri(new Uri("https://mbasic.facebook.com"), doc.DocumentNode.SelectSingleNode("//footer//a[contains(@href,'/story.php')]").Attributes["href"].DeEntitizeValue); // Convert Facebook Watch link back to normal post link
 
             /* Detect group post */
             List<string> uri_segments = new List<string>();
-            foreach (string seg in resp.RequestMessage.RequestUri.Segments)
+            foreach (string seg in req_uri.Segments)
             {
                 if (!seg.StartsWith('?') && seg != "/") uri_segments.Add(seg.Replace("/", ""));
             }
@@ -82,18 +84,8 @@ namespace HRngLite
             if (IsGroupPost && uri_segments[uri_segments.IndexOf("permalink") - 1].All(char.IsDigit)) AuthorID = Convert.ToInt64(uri_segments[uri_segments.IndexOf("permalink") - 1]);
             else
             {
-                var url_params = HttpUtility.ParseQueryString(resp.RequestMessage.RequestUri.Query);
+                var url_params = HttpUtility.ParseQueryString(req_uri.Query);
                 if (url_params.Get("id") != null) AuthorID = Convert.ToInt64(url_params.Get("id"));
-            }
-            /* Attempt to get from post container (not working with images) */
-            if (AuthorID < 0)
-            {
-                var elem = doc.DocumentNode.SelectSingleNode("//div[contains(@data-ft, 'content_owner_id_new')]");
-                if (elem != null)
-                {
-                    dynamic data_ft = JsonConvert.DeserializeObject(elem.Attributes["data-ft"].DeEntitizeValue);
-                    if (data_ft != null) AuthorID = Convert.ToInt64(data_ft.content_owner_id_new);
-                }
             }
             /* Attempt to get from JSON-encoded data conveniently stored in <head>, should work with virtually everything except group posts */
             if (AuthorID < 0)
@@ -103,6 +95,16 @@ namespace HRngLite
                 {
                     dynamic data_ft = JsonConvert.DeserializeObject(elem.InnerText);
                     if (data_ft != null && data_ft.ContainsKey("author") && data_ft.author.ContainsKey("identifier")) AuthorID = Convert.ToInt64(data_ft.author.identifier);
+                }
+            }
+            /* Attempt to get from post container (not working with images) */
+            if (AuthorID < 0)
+            {
+                var elem = doc.DocumentNode.SelectSingleNode("//div[contains(@data-ft, 'content_owner_id_new')]");
+                if (elem != null)
+                {
+                    dynamic data_ft = JsonConvert.DeserializeObject(elem.Attributes["data-ft"].DeEntitizeValue);
+                    if (data_ft != null) AuthorID = Convert.ToInt64(data_ft.content_owner_id_new);
                 }
             }
             /* Attempt to get from actor link (verified working with images) */
@@ -116,12 +118,11 @@ namespace HRngLite
 
             /* Get post ID */
             PostID = -1;
-            /* Attempt to get directly from URL */
-            if (IsGroupPost && uri_segments[uri_segments.IndexOf("permalink") + 1].All(char.IsDigit)) AuthorID = Convert.ToInt64(uri_segments[uri_segments.IndexOf("permalink") + 1]);
-            else
+            /* Attempt to get from actions div, which is by far the most reliable method */
+            if (PostID < 0)
             {
-                var url_params = HttpUtility.ParseQueryString(resp.RequestMessage.RequestUri.Query);
-                if (url_params.Get("story_fbid") != null) PostID = Convert.ToInt64(url_params.Get("story_fbid"));
+                var elem = doc.DocumentNode.SelectSingleNode("//div[starts-with(@id,'actions_')]");
+                if (elem != null) PostID = Convert.ToInt64(elem.Attributes["id"].DeEntitizeValue.Replace("actions_", ""));
             }
             /* Attempt to get from JSON-encoded data conveniently stored in <head>, should work with virtually everything */
             if (PostID < 0)
@@ -130,7 +131,11 @@ namespace HRngLite
                 if (elem != null)
                 {
                     dynamic data_ft = JsonConvert.DeserializeObject(elem.InnerText);
-                    if (data_ft != null && data_ft.ContainsKey("identifier")) PostID = Convert.ToInt64(((string)data_ft.author.identifier).Split(':')[0]);
+                    if (data_ft != null && data_ft.ContainsKey("identifier"))
+                    {
+                        if (((string)data_ft.identifier).Count(c => c == ';') == 3) PostID = Convert.ToInt64(((string)data_ft.identifier).Split(';')[1]); // [AuthorID];[PostID];;x format
+                        else if (((string)data_ft.identifier).Count(c => c == ':') == 2) PostID = Convert.ToInt64(((string)data_ft.identifier).Split(':')[0]); // [PostID]:x:y format
+                    }
                 }
             }
             /* Attempt to get from post container (not working with images) */
@@ -166,29 +171,29 @@ namespace HRngLite
         /// <param name="elem">The comment's root element (i.e. the one with data-sigil="comment" or data-sigil="comment inline-reply").</param>
         /// <param name="comments">The dictionary to store the comment in.</param>
         /// <param name="ids">The list of comment IDs fetched during last pass so such comments can be skipped in this pass.</param>
-        /// <param name="reply">Set to -1 if the comment is not a reply, 0 if the comment is a reply and the parent comment ID is to be discovered by the function, or the parent comment's ID.</param>
+        /// <param name="reply">Set to -1 if the comment is not a reply, or the parent comment's ID.</param>
         /// <param name="muid">Whether to retrieve the UIDs of mentioned accounts.</param>
-        private async Task SaveComment(HtmlNode elem, IDictionary<long, FBComment> comments, IList<long> ids, long reply, bool muid)
+        /// <returns>The comment's ID.</returns>
+        private async Task<long> SaveComment(HtmlNode elem, IDictionary<long, FBComment> comments, IList<long> ids, long reply, bool muid)
         {
             long id = Convert.ToInt64(elem.Attributes["id"].DeEntitizeValue); // Comment ID
+            elem = elem.SelectSingleNode("./div"); // Enter the child div where everything is
             if (!ids.Contains(id))
             {
                 if (!comments.ContainsKey(id))
                 {
                     FBComment comment = new FBComment();
                     comment.ID = id;
-                    var elem_profile_pict = elem.SelectSingleNode("./div[contains(@data-sigil, 'feed_story_ring')]");
-                    comment.AuthorID = Convert.ToInt64(elem_profile_pict.Attributes["data-sigil"].DeEntitizeValue.Replace("feed_story_ring", ""));
-                    var elem_comment = elem_profile_pict.SelectSingleNode("./following-sibling::div[1]");
-                    var elem_author = elem_comment.SelectSingleNode(".//div[@class='_2b05']"); // TODO: Find a better way to do this (i.e. without using classes)
-                    if (elem_author.SelectSingleNode("./a") != null && elem_author.SelectSingleNode("./a").Attributes["href"] != null) UID.Add(elem_author.SelectSingleNode("./a").Attributes["href"].DeEntitizeValue, comment.AuthorID);
-                    comment.AuthorName = elem_author.InnerText; // TODO: Remove the Author text on top of the name
-                    var elem_body = elem_comment.SelectSingleNode("./div[1]//div[@data-sigil='comment-body']");
-                    if (elem_body != null)
-                    {
-                        comment.CommentText = HttpUtility.HtmlDecode(elem_body.InnerText);
-                        comment.CommentText_HTML = elem_body.InnerHtml;
-                    }
+
+                    /* Get author UID and name */
+                    var elem_author_link = elem.SelectSingleNode("./h3/a");
+                    if (elem_author_link.Attributes["href"] != null) comment.AuthorID = await UID.Get(elem_author_link.Attributes["href"].DeEntitizeValue);
+                    comment.AuthorName = elem_author_link.InnerText;
+
+                    /* Get comment text contents (including mentions) */
+                    var elem_body = elem.SelectSingleNode("./div[1]");
+                    comment.CommentText = HttpUtility.HtmlDecode(elem_body.InnerText);
+                    comment.CommentText_HTML = elem_body.InnerHtml;
                     if (comment.CommentText != "")
                     {
                         int placeholder_cnt = -10;
@@ -215,149 +220,115 @@ namespace HRngLite
                             }
                         }
                     }
-                    if (elem_comment.SelectNodes("./div").Count == 4)
+
+                    /* Get media/embed */
+                    var elem_media = elem.SelectSingleNode("./div[2]");
+                    if (elem_media.SelectSingleNode("./div/a[contains(@href, '/photo.php')]") != null) comment.ImageURL = new Uri(new Uri("https://mbasic.facebook.com"), elem_media.SelectSingleNode("./div/a[contains(@href, '/photo.php')]").Attributes["href"].DeEntitizeValue).AbsoluteUri; // Image
+                    else if (elem_media.SelectSingleNode("./div/a[contains(@href, '/video_redirect/')]") != null) comment.VideoURL = new Uri(new Uri("https://mbasic.facebook.com"), elem_media.SelectSingleNode("./div/a[contains(@href, '/video_redirect/')]").Attributes["href"].DeEntitizeValue).AbsoluteUri; // Video
+                    else if (elem_media.SelectSingleNode("./img") != null) comment.StickerURL = elem_media.SelectSingleNode("./img").Attributes["src"].DeEntitizeValue; // Sticker
+                    else if (elem_media.SelectSingleNode("./a[contains(@href, 'lm.facebook.com')]") != null)
                     {
-                        /* Embedded content */
-                        var elem_embed = elem_comment.SelectSingleNode("./div[2]");
-                        var elem_bgimg = elem_embed.SelectSingleNode("./i[contains(@style, 'background-image')]");
-                        if (elem_bgimg != null)
-                        {
-                            var parser = new StylesheetParser();
-                            var style = parser.Parse(elem_bgimg.Attributes["style"].DeEntitizeValue).StyleRules.First() as StyleRule;
-                            comment.StickerURL = style.Style.BackgroundImage.Replace("url(", "").Replace(")", "").Replace("\"", "").Replace("'", "");
-                        }
-                        var elem_embed2 = elem_embed;
-                        if (!elem_embed2.Attributes.Contains("title")) elem_embed2 = elem_embed.SelectSingleNode("./div[@title]");
-                        if (elem_embed2 != null && elem_embed2.Attributes.Contains("title"))
-                        {
-                            comment.EmbedTitle = elem_embed2.Attributes["title"].DeEntitizeValue;
-                            comment.EmbedURL = elem_embed2.SelectSingleNode("./a").Attributes["href"].DeEntitizeValue;
-                            if (comment.EmbedURL.StartsWith('/')) comment.EmbedURL = "https://m.facebook.com" + comment.EmbedURL;
-                        }
-                        var elem_attach = elem_embed.SelectSingleNode("./div[contains(@class, 'attachment')]/*");
-                        if (elem_attach != null)
-                        {
-                            if (elem_attach.Name == "a" && elem_attach.Attributes.Contains("href") && (elem_attach.Attributes["href"].DeEntitizeValue.Contains("photo.php") || elem_attach.Attributes["href"].DeEntitizeValue.Contains("/photos/"))) comment.ImageURL = "https://m.facebook.com" + elem_attach.Attributes["href"].DeEntitizeValue;
-                            if (elem_attach.Name == "div" && elem_attach.Attributes.Contains("data-store") && elem_attach.Attributes["data-store"].DeEntitizeValue.Contains("videoURL"))
-                            {
-                                dynamic data_store = JsonConvert.DeserializeObject(elem_attach.Attributes["data-store"].DeEntitizeValue);
-                                if (data_store != null) comment.VideoURL = data_store.videoURL;
-                            }
-                        }
+                        /* Embed */
+                        var elem_embed = elem_media.SelectSingleNode("./a[contains(@href, 'lm.facebook.com')]");
+                        comment.EmbedURL = elem_embed.Attributes["href"].DeEntitizeValue;
+                        comment.EmbedTitle = elem_embed.SelectSingleNode(".//h3").InnerText;
                     }
+
                     comments.Add(id, comment);
                 }
                 FBComment cmt = comments[id];
-                if (cmt.Parent == -1 && reply != -1)
-                {
-                    /* This comment is a reply */
-                    if (reply == 0)
-                    {
-                        /* Find parent comment */
-                        var elem_parent = elem.SelectSingleNode("./ancestor::div[@data-sigil='comment']");
-                        if (elem_parent != null) elem_parent = elem.SelectSingleNode("");
-                        reply = Convert.ToInt64(elem_parent.Attributes["id"].DeEntitizeValue);
-                    }
-                    cmt.Parent = reply;
-                }
+                if (cmt.Parent == -1 && reply != -1) cmt.Parent = reply; // This comment is a reply
             }
-        }
-
-        /// <summary>
-        ///  Helper function to fetch a post page and parse it as HTML.
-        /// </summary>
-        /// <param name="url">The URL to fetch.</param>
-        /// <param name="pass">The current GetComments pass. If pass=2, P2Client will be used; otherwise, CommonHTTP will be used.</param>
-        /// <returns>The parsed HtmlDocument.</returns>
-        private async Task<HtmlDocument> GetPage(string url, int pass)
-        {
-            HtmlDocument doc = new HtmlDocument();
-            HttpResponseMessage resp;
-            if (pass == 2) resp = await P2Client.Client.GetAsync(url);
-            else resp = await CommonHTTP.Client.GetAsync(url);
-            resp.EnsureSuccessStatusCode();
-            doc.LoadHtml(Regex.Replace(await resp.Content.ReadAsStringAsync(), "(<div class=['\"]hidden_elem['\"]><code[^>]*><!--)|(--></code></div>)", "")); // Defeat Facebook's hide-elements-until-JS-load thing
-            return doc;
+            return id;
         }
 
         public async Task<Dictionary<long, FBComment>> GetComments(Func<float, bool>? cb = null, bool muid = true, bool p1 = true, bool p2 = false)
         {
+            /* TODO: find a way to **RELIABLY** use m.facebook.com for enhanced speed */
             Dictionary<long, FBComment> comments = new Dictionary<long, FBComment>();
 
             int pass = (p1) ? 1 : 2; // We'll do pass 1 first
             float npass = ((p1) ? 1 : 0) + ((p2) ? 1 : 0); // Number of passes to do
 
             for (int pn = 0; pn < (int)npass; pn++, pass++) {
-                /* Load and parse all top-level and visible reply comments */
                 int n = 0, total = 0;
                 bool see_prev = false; // Set if there's only see previous and not see next
-                string url = (IsGroupPost) ? $"https://m.facebook.com/{PostID}" : $"https://m.facebook.com/story.php?story_fbid={PostID}&id={AuthorID}";
-                var reply_elems = new List<HtmlNode>(); // List of reply elements
+                string url = (IsGroupPost) ? $"https://mbasic.facebook.com/{PostID}" : $"https://mbasic.facebook.com/story.php?story_fbid={PostID}&id={AuthorID}";
+                var reply_elems = new Dictionary<long, string>(); // List of view replies URLs
                 var ids = comments.Keys; // List of comment IDs from previous pass (so we can skip comments that we've fetched)
+
+                /* Load and parse all top-level comments */
                 for (int page = 0; ; page++)
                 {
-                    HtmlDocument doc = await GetPage(url, pass);
-                    var comment_elems = doc.DocumentNode.SelectSingleNode("//div[@data-sigil='m-story-view']").SelectNodes(".//div[@data-sigil='comment' or @data-sigil='comment inline-reply']"); // Top-level comments only
+                    HtmlDocument doc = await HTTPHelper.GetRequest((pass == 2) ? P2Client.Client : CommonHTTP.Client, url);
+                    var ufi_comments = doc.DocumentNode.SelectSingleNode("//div[starts-with(@id,'ufi_')]").SelectSingleNode("./div/div[not(@id)]"); // The root element for everything that we will do below
+                    if (ufi_comments == null) break;
+                    var comment_elems = ufi_comments.SelectNodes("./div[not(starts-with(@id, 'see_'))]");
                     if (comment_elems.Count == 0) break;
                     total += comment_elems.Count;
                     if (cb != null & cb((100f / npass) * ((float)n / (float)total + pn)) == false) return null;
                     foreach (var elem in comment_elems)
                     {
-                        bool reply = (elem.Attributes["data-sigil"].DeEntitizeValue == "comment inline-reply");
-                        await SaveComment(elem, comments, ids.ToList(), (reply) ? 0 : -1, muid);
+                        long id = await SaveComment(elem, comments, ids.ToList(), -1, muid);
+
+                        /* Find and save show replies link */
+                        var reply_elem = elem.SelectSingleNode(".//div[contains(@id, 'comment_replies_')]/div/a[contains(@href, '/comment/replies/')]");
+                        if (reply_elem != null) reply_elems.Add(id, new Uri(new Uri("https://mbasic.facebook.com"), reply_elem.Attributes["href"].DeEntitizeValue).AbsoluteUri);
+
                         n++;
                         if (cb != null && cb((100f / npass) * ((float)n / (float)total + pn)) == false) return null;
                     }
 
-                    /* Process show previous/next replies links */
-                    var elem_next = doc.DocumentNode.SelectNodes("//div[starts-with(@data-sigil,'replies-see-')]");
-                    if (elem_next != null)
-                    {
-                        foreach (HtmlNode elem in elem_next) reply_elems.Add(elem.CloneNode(true));
-                    }
-
                     /* Load next page */
-                    var see_elem = doc.DocumentNode.SelectSingleNode($"//div[starts-with(@id, 'see_{((see_prev) ? "prev" : "next")}')]/a");
+                    var see_elem = ufi_comments.SelectSingleNode($"./div[starts-with(@id, 'see_{((see_prev) ? "prev" : "next")}')]/a");
                     if (see_elem == null) {
                         if (page == 0) {
                             see_prev = true;
-                            see_elem = doc.DocumentNode.SelectSingleNode($"//div[starts-with(@id, 'see_{((see_prev) ? "prev" : "next")}')]/a");
+                            see_elem = ufi_comments.SelectSingleNode($"./div[starts-with(@id, 'see_{((see_prev) ? "prev" : "next")}')]/a");
                             if (see_elem == null) break;
                         }
                         else break;
                     }
-                    url = new Uri(new Uri("https://m.facebook.com"), see_elem.Attributes["href"].DeEntitizeValue).AbsoluteUri;
+                    url = new Uri(new Uri("https://mbasic.facebook.com"), see_elem.Attributes["href"].DeEntitizeValue).AbsoluteUri;
                 }
 
-                /* Load hidden reply comments */
-                foreach (HtmlNode replink in reply_elems)
+                /* Load reply comments */
+                foreach (KeyValuePair<long, string> replink in reply_elems)
                 {
-                    url = new Uri(new Uri("https://m.facebook.com"), replink.SelectSingleNode("./a").Attributes["href"].DeEntitizeValue).AbsoluteUri;
-                    long parent = Convert.ToInt64(replink.Attributes["data-reply-to"].DeEntitizeValue);
-                    bool direction = (replink.Attributes["data-sigil"].DeEntitizeValue == "replies-see-prev"); // Set if it's a see-prev (i.e. find other previous replies)
+                    see_prev = false; // Reset so we can reuse
+                    url = replink.Value;
+                    long parent_id = replink.Key; // Just for convenience purposes
                     for (int page = 0; ; page++)
                     {
                         /* Retrieve page */
-                        HtmlDocument doc = await GetPage(url, pass);
-                        var elem_replies_parent = doc.DocumentNode.SelectSingleNode("//header/following-sibling::div[2]");
-                        if (elem_replies_parent == null) break;
+                        HtmlDocument doc = await HTTPHelper.GetRequest((pass == 2) ? P2Client.Client : CommonHTTP.Client, url);
 
                         /* Process replies */
-                        var elem_replies = elem_replies_parent.SelectNodes("./div[@data-sigil='comment']");
+                        var replies = doc.DocumentNode.SelectSingleNode($"//div[@id='{parent_id}']/following-sibling::div");
+                        var elem_replies = replies.SelectNodes("./div[not(starts-with(@id, 'comment_replies'))]");
                         if (elem_replies.Count == 0) break;
                         total += elem_replies.Count;
                         if (cb != null & cb((100f / npass) * ((float)n / (float)total + pn)) == false) return null;
                         foreach (var elem in elem_replies)
                         {
-                            await SaveComment(elem, comments, ids.ToList(), parent, muid);
+                            await SaveComment(elem, comments, ids.ToList(), parent_id, muid);
                             n++;
                             if (cb != null && cb((100f / npass) * ((float)n / (float)total + pn)) == false) return null;
                         }
                         
                         /* Load next page if possible */
-                        var see_elem = elem_replies_parent.SelectSingleNode($"./div[starts-with(@data-sigil, 'replies-see-{((direction) ? "prev" : "next")}')]/a");
-                        if (see_elem == null) break;
-                        url = new Uri(new Uri("https://m.facebook.com"), see_elem.Attributes["href"].DeEntitizeValue).AbsoluteUri;
+                        var see_elem = replies.SelectSingleNode($"./div[starts-with(@id, 'comment_replies_more_{((see_prev) ? 1 : 2)}')]/a");
+                        if (see_elem == null)
+                        {
+                            if (page == 0)
+                            {
+                                see_prev = true;
+                                see_elem = replies.SelectSingleNode($"./div[starts-with(@id, 'comment_replies_more_{((see_prev) ? 1 : 2)}')]/a");
+                                if (see_elem == null) break;
+                            }
+                            else break;
+                        }
+                        url = new Uri(new Uri("https://mbasic.facebook.com"), see_elem.Attributes["href"].DeEntitizeValue).AbsoluteUri;
                     }
                 }
             }
@@ -369,11 +340,21 @@ namespace HRngLite
         /// </summary>
         /// <param name="doc">The HTML document to operate on.</param>
         /// <param name="url">The AJAX fetch URL.</param>
-        private async Task ParseAjax(HtmlDocument doc, string url)
+        /// <returns>The deserialized AJAX payload.</returns>
+        private async Task<dynamic> ParseAjax(HtmlDocument doc, string url)
         {
-            var resp = await CommonHTTP.Client.GetAsync(url);
-            resp.EnsureSuccessStatusCode();
-            dynamic ajax = JsonConvert.DeserializeObject((await resp.Content.ReadAsStringAsync()).Replace("for(;;);", "")); // Parse the AJAX payload, removing the infinite loop placed at the beginning to prevent it from being executed
+            string output = "";
+            for (int i = 0; i < 5; i++)
+            {
+                var resp = await CommonHTTP.Client.GetAsync(url);
+                resp.EnsureSuccessStatusCode();
+                output = await resp.Content.ReadAsStringAsync();
+                if (!output.StartsWith("for (;;);"))
+                    Thread.Sleep(1000); // Wait for a while before trying again (possibly ratelimited)
+                else break;
+            }
+            if (!output.StartsWith("for (;;);")) return null; // Cannot make AJAX request
+            dynamic ajax = JsonConvert.DeserializeObject(output.Replace("for (;;);", "")); // Parse the AJAX payload, removing the infinite loop placed at the beginning to prevent it from being executed
             
             foreach (var action in ajax.payload.actions)
             {
@@ -384,7 +365,7 @@ namespace HRngLite
                     var target = doc.DocumentNode.SelectNodes($"//*[@id='{action.target}']");
                     if (target != null)
                     {
-                        HtmlDocument doc2 = new HtmlDocument(); doc2.LoadHtml($"{action.html}");
+                        HtmlDocument doc2 = new HtmlDocument(); doc2.LoadHtml((string)action.html);
                         foreach (HtmlNode elem in target) elem.AppendChildren(doc2.DocumentNode.ChildNodes);
                     }
                 }
@@ -393,52 +374,91 @@ namespace HRngLite
                     var target = doc.DocumentNode.SelectNodes($"//*[@id='{action.target}']");
                     if (target != null)
                     {
-                        HtmlDocument doc2 = new HtmlDocument(); doc2.LoadHtml(action.html);
+                        HtmlDocument doc2 = new HtmlDocument(); doc2.LoadHtml((string)action.html);
                         foreach (HtmlNode elem in target) elem.ParentNode.ReplaceChild(doc2.DocumentNode.FirstChild, elem);
                     }
                 }
             }
+
+            return ajax;
         }
 
         public async Task<Dictionary<long, FBReact>> GetReactions(Func<float, bool>? cb = null)
         {
-            var css_parser = new StylesheetParser(); // CSS parser
-
             Dictionary<long, FBReact> reactions = new Dictionary<long, FBReact>();
 
-            /* Load reactions page */
-            HtmlDocument doc = await HTTPHelper.GetRequest($"https://m.facebook.com/ufi/reaction/profile/browser/?ft_ent_identifier={PostID}");
-
-            /* Get background-image + background-position => reaction type mapping */
-            Dictionary<string, int> react_map = new Dictionary<string, int>(); // Having string as key instead of tuple should result in better performance
-            foreach(HtmlNode elem in doc.DocumentNode.SelectNodes("//span[@data-sigil='reaction_profile_sigil' and not(contains(@data-store, 'all'))]"))
+            /* Begin loading reactions */
+            long total = -1;
+            HtmlDocument doc;
+            for (int i = 0; i < 5; i++)
             {
-                var style = css_parser.Parse(elem.SelectSingleNode(".//i").Attributes["style"].DeEntitizeValue).StyleRules.First() as StyleRule;
-                dynamic data_store = JsonConvert.DeserializeObject(elem.Attributes["data-store"].DeEntitizeValue);
-                react_map.Add($"{style.Style.BackgroundImage} {style.Style.BackgroundPosition}", Convert.ToInt32(data_store.reactionType));
+                doc = await HTTPHelper.GetRequest($"https://mbasic.facebook.com/ufi/reaction/profile/browser/?ft_ent_identifier={PostID}&av={FBLogin.GetUID()}"); // Fetch the total number of reactions. The av parameter is here for legitimacy purposes.
+                HtmlNode total_elem = doc.DocumentNode.SelectSingleNode("//a[contains(@href, 'total_count')]");
+                if (total_elem != null)
+                {
+                    total = Convert.ToInt64(HttpUtility.ParseQueryString((new Uri(new Uri("https://mbasic.facebook.com"), total_elem.Attributes["href"].DeEntitizeValue)).Query).Get("total_count"));
+                    break;
+                }
+                else Thread.Sleep(500); // Wait for a while before trying again
             }
+            if (total == -1) return null;
+            
+            doc = new HtmlDocument(); doc.LoadHtml("<div id='reaction_profile_browser'></div><div id='reaction_profile_pager'><a></a></div>"); // For housing data sent by Facebook's AJAX
+            dynamic ajax = await ParseAjax(doc, $"https://m.facebook.com/ufi/reaction/profile/browser/fetch/?ft_ent_identifier={PostID}&limit=50&total_count={total}");
+            if (ajax == null) return null;
 
             /* As it turns out, Facebook conveniently provides us with a perfectly ordered list of shown users' IDs in the AJAX URL, so we can use that to speedrun the UID retrieval process */
             List<long> shown_users = new List<long>(); // Where we'll save the IDs
-            string prev_shown = ""; // Facebook stacks the new page's shown users before the previous pages' shown users, so we'll have to save the previous shown users list to filter out
+            string prev_shown = "---"; // Facebook stacks the new page's shown users before the previous pages' shown users, so we'll have to save the previous shown users list to filter out
+
+            /* Another great thing about Facebook's AJAX is that it provides us with the UIDs of accounts with the Message button, so we can parse it and use that */
+            var msg_users = new Dictionary<string, long>(); // Lookup table to convert element ID to UID
+
             /* Load all reactions */
             while (true)
             {
+                /* Add element ID to msg_users */
+                bool done = false;
+                foreach (var action in ajax.payload.actions)
+                {
+                    if (action.cmd == "script")
+                    {
+                        /* Found what we're looking for */
+                        dynamic script_json = JsonConvert.DeserializeObject(Regex.Replace((string)action.code, @"(^.*handle\()|(\);$)", "")); // Parse the JSON contained in the onload script
+
+                        /* Load internal element name to element ID lookup table */
+                        var int_lut = new Dictionary<string, string>();
+                        foreach (var elem in script_json.elements) int_lut.Add((string)elem[0], (string)elem[1]);
+
+                        /* Load instances */
+                        foreach (var inst in script_json.instances)
+                        {
+                            if (inst[1].Count == 2 && inst[2].Count == 2 && ((string)inst[1][1]).StartsWith("__elem_") && int_lut.ContainsKey((string)inst[1][1]))
+                            {
+                                if (!msg_users.ContainsKey(int_lut[(string)inst[1][1]])) msg_users.Add(int_lut[(string)inst[1][1]], (long)inst[2][1]);
+                            }
+                        }
+                    }
+                    /* Check if we've ran out of reactions to load */
+                    else if (action.cmd == "append" && action.target == "reaction_profile_browser" && action.html == "") done = true;
+                }
+                if (done) break;
+
                 var next_elem = doc.DocumentNode.SelectSingleNode("//div[@id='reaction_profile_pager']/a");
                 if (next_elem == null || next_elem.Attributes["data-ajaxify-href"] == null || next_elem.Attributes["href"] == null) break;
                 string shown = HttpUtility.ParseQueryString(next_elem.Attributes["data-ajaxify-href"].DeEntitizeValue.Split('/').Last()).Get("shown_ids");
-                if (prev_shown.Length > 0) shown = shown.Replace(prev_shown, "");
-                foreach (string uid in shown.Split(',', StringSplitOptions.RemoveEmptyEntries))
+                foreach (string uid in shown.Replace(prev_shown, "").Split(',', StringSplitOptions.RemoveEmptyEntries))
                 {
                     shown_users.Add(Convert.ToInt64(uid));
                 }
-                prev_shown = "," + shown + ((prev_shown.Length > 0) ? "," : "") + prev_shown;
-                await ParseAjax(doc, new Uri(new Uri("https://m.facebook.com"), next_elem.Attributes["href"].DeEntitizeValue).AbsoluteUri);
+                prev_shown = "," + shown;
+                ajax = await ParseAjax(doc, new Uri(new Uri("https://m.facebook.com"), next_elem.Attributes["href"].DeEntitizeValue).AbsoluteUri);
+                if (ajax == null) return null;
             }
 
             /* Go through each reaction */
             var react_elems = doc.DocumentNode.SelectNodes("//div[@id='reaction_profile_browser']/div");
-            if(react_elems != null)
+            if (react_elems != null)
             {
                 int n = 0;
                 if (cb != null & cb(0) == false) return null;
@@ -451,7 +471,23 @@ namespace HRngLite
                     long uid = -1;
                     /* From shown user ID list */
                     if (n < shown_users.Count) uid = shown_users[n];
-                    /* Message button method is impossible to perform without JS and Selenium */
+                    /* From element ID -> UID lookup table (above) */
+                    if (uid == -1)
+                    {
+                        var id_elems = elem.SelectNodes(".//div[starts-with(@data-sigil, 'm-') and @id and @id != '']");
+                        if (id_elems != null)
+                        {
+                            foreach (HtmlNode id_elem in id_elems)
+                            {
+                                string id = id_elem.Attributes["id"].DeEntitizeValue;
+                                if (msg_users.ContainsKey(id))
+                                {
+                                    uid = msg_users[id];
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     /* From add friend button */
                     if (uid == -1)
                     {
@@ -488,9 +524,7 @@ namespace HRngLite
                     reaction.UserID = uid;
                     reaction.UserName = elem.SelectSingleNode(".//strong").InnerText;
 
-                    /* Get reaction type */
-                    var style = css_parser.Parse(elem.SelectSingleNode("./i").Attributes["style"].DeEntitizeValue).StyleRules.First() as StyleRule;
-                    reaction.Reaction = (ReactionEnum) react_map[$"{style.Style.BackgroundImage} {style.Style.BackgroundPosition}"];
+                    reaction.Reaction = ReactionEnum.Like; // TODO: Get the exact reaction type
 
                     /* Save reaction */
                     reactions.Remove(uid); // Remove previous reaction if it even exists
@@ -509,14 +543,12 @@ namespace HRngLite
             Dictionary<long, string> shares = new Dictionary<long, string>();
 
             /* Load shares page */
-            HtmlDocument doc = await HTTPHelper.GetRequest($"https://m.facebook.com/browse/shares?id={PostID}");
+            HtmlDocument doc = await HTTPHelper.GetRequest($"https://mbasic.facebook.com/browse/shares?id={PostID}");
 
-            /* Load all accounts */
-
-            /* Go through each account */
+            /* Go through each account in each page */
             while (true)
             {
-                var share_elems = doc.DocumentNode.SelectNodes("//div[contains(@data-sigil, 'content-pane')]//i[not(contains(@class, 'profpic'))]/..");
+                var share_elems = doc.DocumentNode.SelectNodes("//h3/../div/div[not(@id)]/div");
                 if (share_elems != null)
                 {
                     int n = 0;
@@ -524,43 +556,24 @@ namespace HRngLite
                     foreach (HtmlNode elem in share_elems)
                     {
                         /* Get the UID */
-                        string link = elem.SelectSingleNode("./div[1]/div[1]//i[contains(@class, 'profpic')]/..").Attributes["href"].DeEntitizeValue;
+                        string link = elem.SelectSingleNode(".//a[1]").Attributes["href"].DeEntitizeValue;
                         long uid = -1;
-                        /* These methods turn out to be working with shares too */
-                        /* From add friend button */
-                        var elem_data_store = elem.SelectSingleNode(".//a[contains(@data-store, 'id')]");
-                        if (elem_data_store != null)
+
+                        /* Get from add friend link */
+                        var elem_add = elem.SelectSingleNode(".//a[contains(@href, 'add_friend.php')]");
+                        if (elem_add != null)
                         {
-                            dynamic data_store = JsonConvert.DeserializeObject(elem_data_store.Attributes["data-store"].DeEntitizeValue);
-                            uid = data_store.id;
+                            uid = Convert.ToInt64(HttpUtility.ParseQueryString((new Uri(new Uri("https://mbasic.facebook.com"), elem_add.Attributes["href"].DeEntitizeValue)).Query).Get("id"));
                         }
-                        /* From follow button */
-                        if (uid == -1)
-                        {
-                            elem_data_store = elem.SelectSingleNode(".//div[contains(@data-store, 'subject_id')]");
-                            if (elem_data_store != null)
-                            {
-                                dynamic data_store = JsonConvert.DeserializeObject(elem_data_store.Attributes["data-store"].DeEntitizeValue);
-                                uid = data_store.subject_id;
-                            }
-                        }
-                        /* From page like button */
-                        if (uid == -1)
-                        {
-                            elem_data_store = elem.SelectSingleNode(".//div[contains(@data-store, 'pageID')]");
-                            if (elem_data_store != null)
-                            {
-                                dynamic data_store = JsonConvert.DeserializeObject(elem_data_store.Attributes["data-store"].DeEntitizeValue);
-                                uid = data_store.pageID;
-                            }
-                        }
-                        /* Message button is not present so we can ignore it */
+
+                        /* TODO: Is follow link a thing? */
+
                         /* Use UID lookup services */
                         if (uid == -1) uid = await GetUID(link);
                         else UID.Add(link, uid); // Contribute to the UID cache
 
                         /* Save account */
-                        if (!shares.ContainsKey(uid)) shares.Add(uid, elem.SelectSingleNode(".//strong").InnerText);
+                        if (!shares.ContainsKey(uid)) shares.Add(uid, elem.SelectSingleNode(".//a[1]").InnerText);
 
                         n++;
                         if (cb != null && cb(100 * ((float)n / (float)share_elems.Count)) == false) return null;
@@ -570,7 +583,7 @@ namespace HRngLite
                 /* Load next page */
                 var next_elem = doc.DocumentNode.SelectSingleNode("//div[@id='m_more_item']/a");
                 if (next_elem == null) break;
-                doc = await HTTPHelper.GetRequest(new Uri(new Uri("https://m.facebook.com"), next_elem.Attributes["href"].DeEntitizeValue).AbsoluteUri);
+                doc = await HTTPHelper.GetRequest(new Uri(new Uri("https://mbasic.facebook.com"), next_elem.Attributes["href"].DeEntitizeValue).AbsoluteUri);
             }
 
             return shares;
