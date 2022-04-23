@@ -397,7 +397,8 @@ namespace HRngLite
             if (total == -1) return null;
             
             doc = new HtmlDocument(); doc.LoadHtml("<div id='reaction_profile_browser'></div><div id='reaction_profile_pager'><a></a></div>"); // For housing data sent by Facebook's AJAX
-            dynamic ajax = await ParseAjax(doc, $"https://m.facebook.com/ufi/reaction/profile/browser/fetch/?ft_ent_identifier={PostID}&limit=50&total_count={total}");
+            string url = $"https://m.facebook.com/ufi/reaction/profile/browser/fetch/?ft_ent_identifier={PostID}&limit=50&total_count={total}";
+            dynamic ajax = await ParseAjax(doc, url);
             if (ajax == null) return null;
 
             /* As it turns out, Facebook conveniently provides us with a perfectly ordered list of shown users' IDs in the AJAX URL, so we can use that to speedrun the UID retrieval process */
@@ -439,13 +440,18 @@ namespace HRngLite
 
                 var next_elem = doc.DocumentNode.SelectSingleNode("//div[@id='reaction_profile_pager']/a");
                 if (next_elem == null || next_elem.Attributes["data-ajaxify-href"] == null || next_elem.Attributes["href"] == null) break;
+
+                string new_url = new Uri(new Uri("https://m.facebook.com"), next_elem.Attributes["href"].DeEntitizeValue).AbsoluteUri;
+                if (new_url == url) break; // No update
+                url = new_url;
+
                 string shown = HttpUtility.ParseQueryString(next_elem.Attributes["data-ajaxify-href"].DeEntitizeValue.Split('/').Last()).Get("shown_ids");
                 foreach (string uid in shown.Replace(prev_shown, "").Split(',', StringSplitOptions.RemoveEmptyEntries))
                 {
                     shown_users.Add(Convert.ToInt64(uid));
                 }
                 prev_shown = "," + shown;
-                ajax = await ParseAjax(doc, new Uri(new Uri("https://m.facebook.com"), next_elem.Attributes["href"].DeEntitizeValue).AbsoluteUri);
+                ajax = await ParseAjax(doc, new_url);
                 if (ajax == null) return null;
             }
 
@@ -517,7 +523,41 @@ namespace HRngLite
                     reaction.UserID = uid;
                     reaction.UserName = elem.SelectSingleNode(".//strong").InnerText;
 
-                    reaction.Reaction = ReactionEnum.Like; // TODO: Get the exact reaction type
+                    /* Get reaction type */
+                    var elem_rtype = elem.SelectSingleNode("./i");
+                    string r_class = elem_rtype.Attributes["class"].DeEntitizeValue;
+                    if (r_class == "img _59aq img _2sxw")
+                    {
+                        /* Gather via style */
+                        var lut = new Dictionary<string, ReactionEnum>
+                        {
+                            { @"background-image: url('https\3a //scontent.xx.fbcdn.net/m1/v/t6/An_UvxJXg9tdnLU3Y5qjPi0200MLilhzPXUgxzGjQzUMaNcmjdZA6anyrngvkdub33NZzZhd51fpCAEzNHFhko5aKRFP5fS1w_lKwYrzcNLupv27.png?ccb\3d 10-5\26 oh\3d 00_AT_UtuEDoMVLJKkcDbRHoNoa53G8J0mpfS_dwCh1wA6Low\26 oe\3d 6267A979\26 _nc_sid\3d 55e238');background-repeat:no-repeat;background-size:100% 100%;-webkit-background-size:100% 100%;width:16px;height:16px;", ReactionEnum.Like },
+                            { @"background-image: url('https\3a //scontent.xx.fbcdn.net/m1/v/t6/An-SJYN61eefFdoaV8pa0G_5_APCa0prZaqkZGXpCFeUCLCg89UPOqSkSZxJkLy0hAKKpUIPEB91mo9yBBfcAqcwmpEu5jN_jmJufFtJoVJCUklu.png?ccb\3d 10-5\26 oh\3d 00_AT9LWZUIqF4q_n_YfhRCbWD3MJw7UDAob8ro9qajiIC9Dg\26 oe\3d 6268FFDF\26 _nc_sid\3d 55e238');background-repeat:no-repeat;background-size:100% 100%;-webkit-background-size:100% 100%;width:16px;height:16px;", ReactionEnum.Love },
+                            { @"background-image: url('https\3a //scontent.xx.fbcdn.net/m1/v/t6/An_F9bJG7govfshSMBkvcRLcxT0jmiXVYKtr7lgH5AHgUrjjpZ1OD0xyxXYgf7arc0lWgCdrR_KN4Mg7RSN3Gm3W6Gg03N1tQ-ZXzVvFJ_KvvB4.png?ccb\3d 10-5\26 oh\3d 00_AT-QXPwVsdCmtpG-eaaCAPeJ0vyRpN7Hh-ka0bRFv3sG0w\26 oe\3d 62677BE7\26 _nc_sid\3d 55e238');background-repeat:no-repeat;background-size:100% 100%;-webkit-background-size:100% 100%;width:16px;height:16px;", ReactionEnum.Haha },
+                            { @"background-image: url('https\3a //scontent.xx.fbcdn.net/m1/v/t6/An_0KlxkBZwTJgSV9p2pDQkaZcuO9nFP4R72nyZmCnWKIxG_MSUbtZ_uBFHkKhQVvjgeou7ijfWCAKaRfSRFqQS9RcziMUL4BTtfpxJ2KfylUgpq.png?ccb\3d 10-5\26 oh\3d 00_AT8yFd2RuQdAYXwycpqv_FAv8Rqe0-OkxyglAuwbp8O9YQ\26 oe\3d 62691053\26 _nc_sid\3d 55e238');background-repeat:no-repeat;background-size:100% 100%;-webkit-background-size:100% 100%;width:16px;height:16px;", ReactionEnum.Wow },
+                            { @"background-image: url('https\3a //scontent.xx.fbcdn.net/m1/v/t6/An-9fyYLftTy_Mg2cJpugh-vEVNfbtI-fVn4FNS7K-sgIMu9pT62Tb1u9Dfm-xYLtjbLQk-yVHp_IlY_4iMVYp0xLpO7sJvbxbC2OIiRxzS02cOuKEoo.png?ccb\3d 10-5\26 oh\3d 00_AT-rlMaVYqENgmQ2opPaUpsWJZjjfASDpxINNh_Dv8CNDQ\26 oe\3d 62685A98\26 _nc_sid\3d 55e238');background-repeat:no-repeat;background-size:100% 100%;-webkit-background-size:100% 100%;width:16px;height:16px;", ReactionEnum.Care },
+                            { @"background-image: url('https\3a //scontent.xx.fbcdn.net/m1/v/t6/An-0mG6nK_Uk-eBw_Z5hXaQPl2Il-GAtgNisMF_CPi6qvu85Lx2-5PalMJvS7fIbuodHct0V3tJrvSxzau9mOcNxqVhoiy8lxxQ9edz-6r6_o9YroQ.png?ccb\3d 10-5\26 oh\3d 00_AT9C82ddR6wk3TQ-S-arHyG5c8DqFXFOUkfh8_-OOJDB-g\26 oe\3d 62685CC4\26 _nc_sid\3d 55e238');background-repeat:no-repeat;background-size:100% 100%;-webkit-background-size:100% 100%;width:16px;height:16px;", ReactionEnum.Sad },
+                            { @"background-image: url('https\3a //scontent.xx.fbcdn.net/m1/v/t6/An-OzaYGRs8HJMUUdL-Q9pzzUe-6dYQYH0YuulfJGzClIwZB6ubbGwhtChGS8FxnChgEmifrcrhalKyw7ubZeQmjvur00_4Bm3UKlJBnXJyqwKsR.png?ccb\3d 10-5\26 oh\3d 00_AT-uCaRV9XUxZU4OBjNHmpb8JHjCU5gLnm3N4bHiXtPBGg\26 oe\3d 62694A2B\26 _nc_sid\3d 55e238');background-repeat:no-repeat;background-size:100% 100%;-webkit-background-size:100% 100%;width:16px;height:16px;", ReactionEnum.Angry },
+                            { @"background-image: url('https\3a //static.xx.fbcdn.net/rsrc.php/v3/y4/r/W_Vdj9wA1g9.png');background-repeat:no-repeat;background-size:100% 100%;-webkit-background-size:100% 100%;width:16px;height:16px;", ReactionEnum.Pride },
+                            { @"background-image: url('https\3a //static.xx.fbcdn.net/rsrc.php/v3/yp/r/ZXxRcAexGpd.png');background-repeat:no-repeat;background-size:100% 100%;-webkit-background-size:100% 100%;width:16px;height:16px;", ReactionEnum.Thankful }
+                        };
+                        reaction.Reaction = lut[elem_rtype.Attributes["style"].DeEntitizeValue];
+                    }
+                    else
+                    {
+                        /* Gather via class */
+                        var lut = new Dictionary<string, ReactionEnum>
+                        {
+                            { "_59aq img sp_LdwxfpG67Bn sx_3a00ef", ReactionEnum.Like },
+                            { "_59aq img sp_LdwxfpG67Bn sx_f21116", ReactionEnum.Love },
+                            { "_59aq img sp_LdwxfpG67Bn sx_ce3068", ReactionEnum.Haha },
+                            { "_59aq img sp_LdwxfpG67Bn sx_d80e3a", ReactionEnum.Wow },
+                            { "_59aq img sp_LdwxfpG67Bn sx_d8e63d", ReactionEnum.Care },
+                            { "_59aq img sp_LdwxfpG67Bn sx_c3ed6c", ReactionEnum.Sad },
+                            { "_59aq img sp_LdwxfpG67Bn sx_199220", ReactionEnum.Angry }
+                        };
+                        reaction.Reaction = lut[r_class];
+                    }
 
                     /* Save reaction */
                     reactions.Remove(uid); // Remove previous reaction if it even exists
