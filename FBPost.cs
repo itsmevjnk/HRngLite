@@ -12,6 +12,7 @@
 
 using System.Text.RegularExpressions;
 using System.Web;
+using System.Linq;
 
 using HtmlAgilityPack;
 using Newtonsoft.Json;
@@ -28,6 +29,11 @@ namespace HRngLite
         public bool IsGroupPost { get; internal set; } = false;
 
         /// <summary>
+        ///  The reactions lookup table to be used by GetReactions().
+        /// </summary>
+        public dynamic? ReactionsLut { get; internal set; }
+
+        /// <summary>
         ///  Drop-in replacement for UID.Get() which adds handling code for cases where the account's URL is profile.php (which points to the account being checked).
         /// </summary>
         /// <returns>Same as <c>UID.Get()</c>.</returns>
@@ -39,11 +45,35 @@ namespace HRngLite
 
         /* Functions specified by the IFBPost interface */
 
+        /// <summary>
+        ///  Attempt to get the IDs of the post and its author.
+        /// </summary>
+        /// <param name="id">The post's ID.</param>
+        /// <returns>
+        ///  0 if the initialization is successful, or one of these values on failure:
+        ///  <list type="bullet">
+        ///   <item><description>-1: Invalid URL</description></item>
+        ///   <item><description>-2: Invalid webpage output (e.g. wrong URL, ratelimited by Facebook, or not logged in)</description></item>
+        ///   <item><description>-3: Unable to get reactions lookup table</description></item>
+        ///  </list>
+        /// </returns>
         public async Task<int> Initialize(long id)
         {
             return await Initialize($"https://m.facebook.com/{id}");
         }
 
+        /// <summary>
+        ///  Attempt to get the IDs of the post and its author.
+        /// </summary>
+        /// <param name="url">The post's URL.</param>
+        /// <returns>
+        ///  0 if the initialization is successful, or one of these values on failure:
+        ///  <list type="bullet">
+        ///   <item><description>-1: Invalid URL</description></item>
+        ///   <item><description>-2: Invalid webpage output (e.g. wrong URL, ratelimited by Facebook, or not logged in)</description></item>
+        ///   <item><description>-3: Unable to get reactions lookup table</description></item>
+        ///  </list>
+        /// </returns>
         public async Task<int> Initialize(string url)
         {
             if (url.Length == 0) return -1; // Return right away
@@ -154,6 +184,12 @@ namespace HRngLite
                 if (elem != null) PostID = Convert.ToInt64(elem.Attributes["id"].DeEntitizeValue.Replace("ufi_", ""));
             }
             if (PostID < 0) return -2;
+
+            /* Gather reactions lookup table */
+            resp = await CommonHTTP.Client.GetAsync("https://raw.githubusercontent.com/itsmevjnk/HRngLite/main/Reactions.json");
+            resp.EnsureSuccessStatusCode();
+            ReactionsLut = JsonConvert.DeserializeObject(await resp.Content.ReadAsStringAsync());
+            if (ReactionsLut == null) return -3;
 
             return 0;
         }
@@ -376,6 +412,36 @@ namespace HRngLite
             return ajax;
         }
 
+        /// <summary>
+        ///  Helper function to match a reaction type <c>&lt;i&gt;></c> element against a list of patterns.
+        /// </summary>
+        /// <param name="elem">The element to be matched against.</param>
+        /// <param name="pattern">The list of "patterns" (class and style (optional)).</param>
+        /// <returns></returns>
+        private bool GetReactionType(HtmlNode elem, dynamic pattern)
+        {
+            var e_class = elem.Attributes["class"].DeEntitizeValue.Split(' ', StringSplitOptions.RemoveEmptyEntries).ToList();
+            foreach(dynamic p in pattern)
+            {
+                var p_eclass = new List<string>(); foreach (string c in p.eclass) p_eclass.Add(c); // Very painful, but looks like this is the only way
+                if (e_class.Count == p_eclass.Count && e_class.All(p_eclass.Contains))
+                {
+                    if (!p.ContainsKey("estyle")) return true; // No style to check
+                    /* Check style */
+                    if (elem.Attributes["style"] == null) return false;
+                    var p_estyle = new Dictionary<string, string>(); foreach (var s in p.estyle) p_estyle.Add(s.Name, s.Value.Value);
+                    var e_style = new Dictionary<string, string>();
+                    foreach (var s in elem.Attributes["style"].DeEntitizeValue.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                    {
+                        var s_pair = s.Split(':', StringSplitOptions.TrimEntries);
+                        e_style.Add(s_pair[0], s_pair[1]);
+                    }
+                    if (e_style.Count == p_estyle.Count && e_style.All(p_estyle.Contains)) return true;
+                }
+            }
+            return false;
+        }
+
         public async Task<Dictionary<long, FBReact>> GetReactions(Func<float, bool>? cb = null)
         {
             Dictionary<long, FBReact> reactions = new Dictionary<long, FBReact>();
@@ -525,39 +591,15 @@ namespace HRngLite
 
                     /* Get reaction type */
                     var elem_rtype = elem.SelectSingleNode("./i");
-                    string r_class = elem_rtype.Attributes["class"].DeEntitizeValue;
-                    if (r_class == "img _59aq img _2sxw")
-                    {
-                        /* Gather via style */
-                        var lut = new Dictionary<string, ReactionEnum>
-                        {
-                            { @"background-image: url('https\3a //scontent.xx.fbcdn.net/m1/v/t6/An_UvxJXg9tdnLU3Y5qjPi0200MLilhzPXUgxzGjQzUMaNcmjdZA6anyrngvkdub33NZzZhd51fpCAEzNHFhko5aKRFP5fS1w_lKwYrzcNLupv27.png?ccb\3d 10-5\26 oh\3d 00_AT_UtuEDoMVLJKkcDbRHoNoa53G8J0mpfS_dwCh1wA6Low\26 oe\3d 6267A979\26 _nc_sid\3d 55e238');background-repeat:no-repeat;background-size:100% 100%;-webkit-background-size:100% 100%;width:16px;height:16px;", ReactionEnum.Like },
-                            { @"background-image: url('https\3a //scontent.xx.fbcdn.net/m1/v/t6/An-SJYN61eefFdoaV8pa0G_5_APCa0prZaqkZGXpCFeUCLCg89UPOqSkSZxJkLy0hAKKpUIPEB91mo9yBBfcAqcwmpEu5jN_jmJufFtJoVJCUklu.png?ccb\3d 10-5\26 oh\3d 00_AT9LWZUIqF4q_n_YfhRCbWD3MJw7UDAob8ro9qajiIC9Dg\26 oe\3d 6268FFDF\26 _nc_sid\3d 55e238');background-repeat:no-repeat;background-size:100% 100%;-webkit-background-size:100% 100%;width:16px;height:16px;", ReactionEnum.Love },
-                            { @"background-image: url('https\3a //scontent.xx.fbcdn.net/m1/v/t6/An_F9bJG7govfshSMBkvcRLcxT0jmiXVYKtr7lgH5AHgUrjjpZ1OD0xyxXYgf7arc0lWgCdrR_KN4Mg7RSN3Gm3W6Gg03N1tQ-ZXzVvFJ_KvvB4.png?ccb\3d 10-5\26 oh\3d 00_AT-QXPwVsdCmtpG-eaaCAPeJ0vyRpN7Hh-ka0bRFv3sG0w\26 oe\3d 62677BE7\26 _nc_sid\3d 55e238');background-repeat:no-repeat;background-size:100% 100%;-webkit-background-size:100% 100%;width:16px;height:16px;", ReactionEnum.Haha },
-                            { @"background-image: url('https\3a //scontent.xx.fbcdn.net/m1/v/t6/An_0KlxkBZwTJgSV9p2pDQkaZcuO9nFP4R72nyZmCnWKIxG_MSUbtZ_uBFHkKhQVvjgeou7ijfWCAKaRfSRFqQS9RcziMUL4BTtfpxJ2KfylUgpq.png?ccb\3d 10-5\26 oh\3d 00_AT8yFd2RuQdAYXwycpqv_FAv8Rqe0-OkxyglAuwbp8O9YQ\26 oe\3d 62691053\26 _nc_sid\3d 55e238');background-repeat:no-repeat;background-size:100% 100%;-webkit-background-size:100% 100%;width:16px;height:16px;", ReactionEnum.Wow },
-                            { @"background-image: url('https\3a //scontent.xx.fbcdn.net/m1/v/t6/An-9fyYLftTy_Mg2cJpugh-vEVNfbtI-fVn4FNS7K-sgIMu9pT62Tb1u9Dfm-xYLtjbLQk-yVHp_IlY_4iMVYp0xLpO7sJvbxbC2OIiRxzS02cOuKEoo.png?ccb\3d 10-5\26 oh\3d 00_AT-rlMaVYqENgmQ2opPaUpsWJZjjfASDpxINNh_Dv8CNDQ\26 oe\3d 62685A98\26 _nc_sid\3d 55e238');background-repeat:no-repeat;background-size:100% 100%;-webkit-background-size:100% 100%;width:16px;height:16px;", ReactionEnum.Care },
-                            { @"background-image: url('https\3a //scontent.xx.fbcdn.net/m1/v/t6/An-0mG6nK_Uk-eBw_Z5hXaQPl2Il-GAtgNisMF_CPi6qvu85Lx2-5PalMJvS7fIbuodHct0V3tJrvSxzau9mOcNxqVhoiy8lxxQ9edz-6r6_o9YroQ.png?ccb\3d 10-5\26 oh\3d 00_AT9C82ddR6wk3TQ-S-arHyG5c8DqFXFOUkfh8_-OOJDB-g\26 oe\3d 62685CC4\26 _nc_sid\3d 55e238');background-repeat:no-repeat;background-size:100% 100%;-webkit-background-size:100% 100%;width:16px;height:16px;", ReactionEnum.Sad },
-                            { @"background-image: url('https\3a //scontent.xx.fbcdn.net/m1/v/t6/An-OzaYGRs8HJMUUdL-Q9pzzUe-6dYQYH0YuulfJGzClIwZB6ubbGwhtChGS8FxnChgEmifrcrhalKyw7ubZeQmjvur00_4Bm3UKlJBnXJyqwKsR.png?ccb\3d 10-5\26 oh\3d 00_AT-uCaRV9XUxZU4OBjNHmpb8JHjCU5gLnm3N4bHiXtPBGg\26 oe\3d 62694A2B\26 _nc_sid\3d 55e238');background-repeat:no-repeat;background-size:100% 100%;-webkit-background-size:100% 100%;width:16px;height:16px;", ReactionEnum.Angry },
-                            { @"background-image: url('https\3a //static.xx.fbcdn.net/rsrc.php/v3/y4/r/W_Vdj9wA1g9.png');background-repeat:no-repeat;background-size:100% 100%;-webkit-background-size:100% 100%;width:16px;height:16px;", ReactionEnum.Pride },
-                            { @"background-image: url('https\3a //static.xx.fbcdn.net/rsrc.php/v3/yp/r/ZXxRcAexGpd.png');background-repeat:no-repeat;background-size:100% 100%;-webkit-background-size:100% 100%;width:16px;height:16px;", ReactionEnum.Thankful }
-                        };
-                        reaction.Reaction = lut[elem_rtype.Attributes["style"].DeEntitizeValue];
-                    }
-                    else
-                    {
-                        /* Gather via class */
-                        var lut = new Dictionary<string, ReactionEnum>
-                        {
-                            { "_59aq img sp_LdwxfpG67Bn sx_3a00ef", ReactionEnum.Like },
-                            { "_59aq img sp_LdwxfpG67Bn sx_f21116", ReactionEnum.Love },
-                            { "_59aq img sp_LdwxfpG67Bn sx_ce3068", ReactionEnum.Haha },
-                            { "_59aq img sp_LdwxfpG67Bn sx_d80e3a", ReactionEnum.Wow },
-                            { "_59aq img sp_LdwxfpG67Bn sx_d8e63d", ReactionEnum.Care },
-                            { "_59aq img sp_LdwxfpG67Bn sx_c3ed6c", ReactionEnum.Sad },
-                            { "_59aq img sp_LdwxfpG67Bn sx_199220", ReactionEnum.Angry }
-                        };
-                        reaction.Reaction = lut[r_class];
-                    }
+                    if (GetReactionType(elem_rtype, ReactionsLut.like)) reaction.Reaction = ReactionEnum.Like;
+                    else if (GetReactionType(elem_rtype, ReactionsLut.care)) reaction.Reaction = ReactionEnum.Care;
+                    else if (GetReactionType(elem_rtype, ReactionsLut.love)) reaction.Reaction = ReactionEnum.Love;
+                    else if (GetReactionType(elem_rtype, ReactionsLut.haha)) reaction.Reaction = ReactionEnum.Haha;
+                    else if (GetReactionType(elem_rtype, ReactionsLut.wow)) reaction.Reaction = ReactionEnum.Wow;
+                    else if (GetReactionType(elem_rtype, ReactionsLut.sad)) reaction.Reaction = ReactionEnum.Sad;
+                    else if (GetReactionType(elem_rtype, ReactionsLut.angry)) reaction.Reaction = ReactionEnum.Angry;
+                    else if (GetReactionType(elem_rtype, ReactionsLut.pride)) reaction.Reaction = ReactionEnum.Pride;
+                    else if (GetReactionType(elem_rtype, ReactionsLut.thankful)) reaction.Reaction = ReactionEnum.Thankful;
 
                     /* Save reaction */
                     reactions.Remove(uid); // Remove previous reaction if it even exists
