@@ -29,11 +29,6 @@ namespace HRngLite
         public bool IsGroupPost { get; internal set; } = false;
 
         /// <summary>
-        ///  The reactions lookup table to be used by GetReactions().
-        /// </summary>
-        public dynamic? ReactionsLut { get; internal set; }
-
-        /// <summary>
         ///  Drop-in replacement for UID.Get() which adds handling code for cases where the account's URL is profile.php (which points to the account being checked).
         /// </summary>
         /// <returns>Same as <c>UID.Get()</c>.</returns>
@@ -54,7 +49,6 @@ namespace HRngLite
         ///  <list type="bullet">
         ///   <item><description>-1: Invalid URL</description></item>
         ///   <item><description>-2: Invalid webpage output (e.g. wrong URL, ratelimited by Facebook, or not logged in)</description></item>
-        ///   <item><description>-3: Unable to get reactions lookup table</description></item>
         ///  </list>
         /// </returns>
         public async Task<int> Initialize(long id)
@@ -71,7 +65,6 @@ namespace HRngLite
         ///  <list type="bullet">
         ///   <item><description>-1: Invalid URL</description></item>
         ///   <item><description>-2: Invalid webpage output (e.g. wrong URL, ratelimited by Facebook, or not logged in)</description></item>
-        ///   <item><description>-3: Unable to get reactions lookup table</description></item>
         ///  </list>
         /// </returns>
         public async Task<int> Initialize(string url)
@@ -184,12 +177,6 @@ namespace HRngLite
                 if (elem != null) PostID = Convert.ToInt64(elem.Attributes["id"].DeEntitizeValue.Replace("ufi_", ""));
             }
             if (PostID < 0) return -2;
-
-            /* Gather reactions lookup table */
-            resp = await CommonHTTP.Client.GetAsync("https://raw.githubusercontent.com/itsmevjnk/HRngLite/main/Reactions.json");
-            resp.EnsureSuccessStatusCode();
-            ReactionsLut = JsonConvert.DeserializeObject(await resp.Content.ReadAsStringAsync());
-            if (ReactionsLut == null) return -3;
 
             return 0;
         }
@@ -412,36 +399,6 @@ namespace HRngLite
             return ajax;
         }
 
-        /// <summary>
-        ///  Helper function to match a reaction type <c>&lt;i&gt;></c> element against a list of patterns.
-        /// </summary>
-        /// <param name="elem">The element to be matched against.</param>
-        /// <param name="pattern">The list of "patterns" (class and style (optional)).</param>
-        /// <returns></returns>
-        private bool GetReactionType(HtmlNode elem, dynamic pattern)
-        {
-            var e_class = elem.Attributes["class"].DeEntitizeValue.Split(' ', StringSplitOptions.RemoveEmptyEntries).ToList();
-            foreach(dynamic p in pattern)
-            {
-                var p_eclass = new List<string>(); foreach (string c in p.eclass) p_eclass.Add(c); // Very painful, but looks like this is the only way
-                if (e_class.Count == p_eclass.Count && e_class.All(p_eclass.Contains))
-                {
-                    if (!p.ContainsKey("estyle")) return true; // No style to check
-                    /* Check style */
-                    if (elem.Attributes["style"] == null) return false;
-                    var p_estyle = new Dictionary<string, string>(); foreach (var s in p.estyle) p_estyle.Add(s.Name, s.Value.Value);
-                    var e_style = new Dictionary<string, string>();
-                    foreach (var s in elem.Attributes["style"].DeEntitizeValue.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-                    {
-                        var s_pair = s.Split(':', StringSplitOptions.TrimEntries);
-                        e_style.Add(s_pair[0], s_pair[1]);
-                    }
-                    if (e_style.Count == p_estyle.Count && e_style.All(p_estyle.Contains)) return true;
-                }
-            }
-            return false;
-        }
-
         public async Task<Dictionary<long, FBReact>> GetReactions(Func<float, bool>? cb = null)
         {
             Dictionary<long, FBReact> reactions = new Dictionary<long, FBReact>();
@@ -590,16 +547,7 @@ namespace HRngLite
                     reaction.UserName = elem.SelectSingleNode(".//strong").InnerText;
 
                     /* Get reaction type */
-                    var elem_rtype = elem.SelectSingleNode("./i");
-                    if (GetReactionType(elem_rtype, ReactionsLut.like)) reaction.Reaction = ReactionEnum.Like;
-                    else if (GetReactionType(elem_rtype, ReactionsLut.care)) reaction.Reaction = ReactionEnum.Care;
-                    else if (GetReactionType(elem_rtype, ReactionsLut.love)) reaction.Reaction = ReactionEnum.Love;
-                    else if (GetReactionType(elem_rtype, ReactionsLut.haha)) reaction.Reaction = ReactionEnum.Haha;
-                    else if (GetReactionType(elem_rtype, ReactionsLut.wow)) reaction.Reaction = ReactionEnum.Wow;
-                    else if (GetReactionType(elem_rtype, ReactionsLut.sad)) reaction.Reaction = ReactionEnum.Sad;
-                    else if (GetReactionType(elem_rtype, ReactionsLut.angry)) reaction.Reaction = ReactionEnum.Angry;
-                    else if (GetReactionType(elem_rtype, ReactionsLut.pride)) reaction.Reaction = ReactionEnum.Pride;
-                    else if (GetReactionType(elem_rtype, ReactionsLut.thankful)) reaction.Reaction = ReactionEnum.Thankful;
+                    reaction.Reaction = FBReactUtil.GetReaction(elem.SelectSingleNode("./i"));
 
                     /* Save reaction */
                     reactions.Remove(uid); // Remove previous reaction if it even exists
